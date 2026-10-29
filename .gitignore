@@ -1,0 +1,30 @@
+# Pipeline scratch space at the repo root (embeddings, translators, heads, models, ad-hoc runs)
+/data/
+/models/
+/results/
+/logs/
+**/logs/
+hf_temp_cache/
+wandb/
+*.log
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+.ipynb_checkpoints/
+
+# Environments
+.env
+.venv/
+env/
+venv/
+
+# Editors / OS / tools
+.idea/
+.vscode/
+*.swp
+.DS_Store
+.claude/

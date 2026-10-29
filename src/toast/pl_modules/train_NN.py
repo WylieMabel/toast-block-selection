@@ -1,0 +1,285 @@
+from collections import defaultdict
+
+import numpy as np
+import torch
+import torch.nn as nn
+from sklearn.metrics import average_precision_score, roc_auc_score
+from sklearn.preprocessing import label_binarize
+from tqdm import tqdm
+
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+
+def _softmax_np(x: np.ndarray) -> np.ndarray:
+    x = x - x.max(axis=-1, keepdims=True)
+    e = np.exp(x)
+    return e / e.sum(axis=-1, keepdims=True)
+
+
+def _auroc_auprc(all_logits: np.ndarray, all_labels: np.ndarray, is_multilabel: bool):
+    """AUROC and macro-AUPRC from raw (pre-softmax) logits + integer (or multi-hot) labels.
+
+    Binary/multiclass: scored on softmax probabilities, one-vs-rest macro-averaged for
+    >2 classes (sklearn's roc_auc_score/average_precision_score need the positive-class
+    column for binary, not the full probability matrix). Multilabel: scored directly on
+    logits, matching the existing macro-AUC call above (monotonic sigmoid doesn't change
+    ranking, so raw logits and probabilities give identical AUROC/AUPRC here).
+
+    Either metric comes back as NaN (with a printed warning) if sklearn can't compute it --
+    e.g. a batch/split missing one class entirely, which raises rather than returning a
+    degenerate score.
+    """
+    if is_multilabel:
+        try:
+            auroc = roc_auc_score(all_labels, all_logits, average="macro")
+        except Exception as e:
+            print(f"Warning: could not compute macro-AUROC: {e}.")
+            auroc = float("nan")
+        try:
+            auprc = average_precision_score(all_labels, all_logits, average="macro")
+        except Exception as e:
+            print(f"Warning: could not compute macro-AUPRC: {e}.")
+            auprc = float("nan")
+        return auroc, auprc
+
+    probs = _softmax_np(all_logits)
+    num_classes = probs.shape[-1]
+
+    try:
+        if num_classes == 2:
+            auroc = roc_auc_score(all_labels, probs[:, 1])
+        else:
+            auroc = roc_auc_score(all_labels, probs, multi_class="ovr", average="macro")
+    except Exception as e:
+        print(f"Warning: could not compute AUROC: {e}.")
+        auroc = float("nan")
+
+    try:
+        if num_classes == 2:
+            auprc = average_precision_score(all_labels, probs[:, 1])
+        else:
+            y_bin = label_binarize(all_labels, classes=list(range(num_classes)))
+            auprc = average_precision_score(y_bin, probs, average="macro")
+    except Exception as e:
+        print(f"Warning: could not compute AUPRC: {e}.")
+        auprc = float("nan")
+
+    return auroc, auprc
+
+
+def train_classifier(
+    model: nn.Module,
+    train_data_loader: torch.utils.data.DataLoader,
+    test_data_loader: torch.utils.data.DataLoader,
+    optimizer: torch.optim.Optimizer,
+    criterion: nn.Module,
+    label_column_name: str,
+    num_epochs: int = 5,
+    evaluation_interval: int = 5,
+    save_results: bool = False,
+    scheduler=None,
+    wandb_run=None,
+    is_multilabel: bool = False,
+):
+    train_losses = []
+    train_accuracies = []
+
+    eval_losses = []
+    eval_accuracies = []
+    eval_aurocs = []
+    eval_auprcs = []
+    eval_indexes = []
+
+    model = model.to(device)
+    model.train()
+
+    for epoch in (bar := tqdm(range(num_epochs), desc="Epochs")):
+        total_loss = 0.0
+        correct_train = 0
+        total_train = 0
+
+        for i, batch in enumerate(train_data_loader):
+            try:
+                input_embeddings = batch["images"].to(device, non_blocking=True)
+                target = batch[label_column_name].to(device, non_blocking=True)
+
+                if is_multilabel:
+                    target = target.float()
+
+                batch_on_device = {"images": input_embeddings}
+            except KeyError as e:
+                print(
+                    f"\nError: Batch dictionary missing expected key: {e} in training batch {i}. Skipping batch."
+                )
+                print(f"Batch keys: {batch.keys()}")
+                continue
+            except Exception as e:
+                print(f"\nError moving batch {i} to device: {e}. Skipping batch.")
+                continue
+
+            optimizer.zero_grad()
+
+            predicted = model(batch_on_device)
+            loss = criterion(predicted, target)
+
+            loss.backward()
+            optimizer.step()
+
+            total_loss += loss.item()
+
+            if is_multilabel:
+                # Per-label accuracy: correct counts every (sample, label) cell, so the
+                # denominator must too -- target.size(0) alone let this exceed 1.
+                predicted_labels = (torch.sigmoid(predicted.detach()) > 0.5).long()
+                correct_train += (predicted_labels == target.long()).sum().item()
+                total_train += target.numel()
+            else:
+                _, predicted_labels = torch.max(predicted.detach(), 1)
+                correct_train += (predicted_labels == target).sum().item()
+                total_train += target.size(0)
+
+        average_epoch_loss = total_loss / len(train_data_loader) if len(train_data_loader) > 0 else 0.0
+        train_losses.append(average_epoch_loss)
+
+        train_epoch_accuracy = correct_train / total_train if total_train > 0 else 0.0
+        train_accuracies.append(train_epoch_accuracy)
+
+        current_lr = scheduler.get_last_lr()[0] if scheduler is not None else optimizer.param_groups[0]["lr"]
+
+        if scheduler is not None:
+            scheduler.step()
+
+        log_dict = {
+            "epoch": epoch + 1,
+            "train/loss": average_epoch_loss,
+            "train/acc": train_epoch_accuracy,
+            "lr": current_lr,
+        }
+
+        if epoch % evaluation_interval == 0 or epoch == num_epochs - 1:
+            eval_loss, eval_accuracy, eval_auroc, eval_auprc = eval_classifier(
+                model=model,
+                test_data_loader=test_data_loader,
+                criterion=criterion,
+                label_column_name=label_column_name,
+                is_multilabel=is_multilabel,
+            )
+            eval_losses.append(eval_loss)
+            eval_accuracies.append(eval_accuracy)
+            eval_aurocs.append(eval_auroc)
+            eval_auprcs.append(eval_auprc)
+            eval_indexes.append(epoch)
+            model.train()
+            bar.set_description(
+                f"Epoch {epoch}/{num_epochs-1}, Train Loss: {average_epoch_loss:.4f}, Train Acc: {train_epoch_accuracy:.4f}, Eval Loss: {eval_loss:.4f}, Eval Acc: {eval_accuracy:.4f}, AUROC: {eval_auroc:.4f}, AUPRC: {eval_auprc:.4f}"
+            )
+            log_dict["test/loss"] = eval_loss
+            log_dict["test/acc"] = eval_accuracy
+            log_dict["test/auroc"] = eval_auroc
+            log_dict["test/auprc"] = eval_auprc
+        else:
+            bar.set_description(
+                f"Epoch {epoch}/{num_epochs-1}, Train Loss: {average_epoch_loss:.4f}, Train Acc: {train_epoch_accuracy:.4f}"
+            )
+
+        if wandb_run is not None:
+            wandb_run.log(log_dict)
+
+    if save_results:
+        _, _, _, _, test_results = eval_classifier(
+            model, test_data_loader, criterion, label_column_name, save_results=True, is_multilabel=is_multilabel
+        )
+        return (train_losses, eval_losses, train_accuracies, eval_accuracies, eval_indexes,
+                eval_aurocs, eval_auprcs, test_results)
+
+    return (train_losses, eval_losses, train_accuracies, eval_accuracies, eval_indexes,
+            eval_aurocs, eval_auprcs)
+
+
+def eval_classifier(
+    model: nn.Module,
+    test_data_loader: torch.utils.data.DataLoader,
+    criterion: nn.Module,
+    label_column_name: str,
+    save_results: bool = False,
+    is_multilabel: bool = False,
+):
+
+    model.eval()
+    total_loss = 0.0
+    correct_eval = 0
+    total_eval = 0
+
+    if save_results:
+        results = defaultdict(list)
+
+    all_logits = []
+    all_labels = []
+
+    with torch.no_grad():
+        for i, batch in enumerate(test_data_loader):
+            try:
+                input_embeddings = batch["images"].to(device, non_blocking=True)
+                target = batch[label_column_name].to(device, non_blocking=True)
+
+                if is_multilabel:
+                    target = target.float()
+
+                batch_on_device = {"images": input_embeddings}
+            except KeyError as e:
+                print(
+                    f"\nError: Batch dictionary missing expected key: {e} in evaluation batch {i}. Skipping batch."
+                )
+                print(f"Batch keys: {batch.keys()}")
+                continue
+            except Exception as e:
+                print(f"\nError moving batch {i} to device: {e}. Skipping batch.")
+                continue
+
+            predicted = model(batch_on_device)
+
+            loss = criterion(predicted, target)
+
+            total_loss += loss.item()
+
+            all_logits.append(predicted.cpu().numpy())
+            all_labels.append(target.cpu().numpy())
+
+            if is_multilabel:
+                predicted_labels = (torch.sigmoid(predicted) > 0.5).long()
+                correct_eval += (predicted_labels == target.long()).sum().item()
+                total_eval += target.numel()
+            else:
+                _, predicted_labels = torch.max(predicted, 1)
+                correct_eval += (predicted_labels == target).sum().item()
+                total_eval += target.size(0)
+
+            if save_results:
+                results["images"].append(input_embeddings.cpu().numpy())
+                results["logits"].append(predicted.cpu().numpy())
+                results["labels"].append(target.cpu().numpy())
+
+    average_eval_loss = total_loss / len(test_data_loader) if len(test_data_loader) > 0 else 0.0
+
+    all_logits = np.concatenate(all_logits, axis=0)
+    all_labels = np.concatenate(all_labels, axis=0)
+    eval_auroc, eval_auprc = _auroc_auprc(all_logits, all_labels, is_multilabel)
+
+    if is_multilabel:
+        # Kept as macro-AUROC for backward compatibility -- this is what earlier callers
+        # read as "accuracy" for multilabel runs and compare against (see
+        # ORIG_HEAD_DATASETS / delta_acc bookkeeping in train_skipped_full.py). Falls back
+        # to label accuracy only if AUROC itself couldn't be computed.
+        eval_accuracy = eval_auroc if not np.isnan(eval_auroc) else (
+            correct_eval / total_eval if total_eval > 0 else 0.0
+        )
+    else:
+        eval_accuracy = correct_eval / total_eval if total_eval > 0 else 0.0
+
+    if save_results:
+        results["images"] = np.concatenate(results["images"], axis=0)
+        results["logits"] = np.concatenate(results["logits"], axis=0)
+        results["labels"] = np.concatenate(results["labels"], axis=0)
+        return average_eval_loss, eval_accuracy, eval_auroc, eval_auprc, results
+
+    return average_eval_loss, eval_accuracy, eval_auroc, eval_auprc

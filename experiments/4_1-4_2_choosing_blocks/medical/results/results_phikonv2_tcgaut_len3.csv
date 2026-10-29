@@ -1,0 +1,9 @@
+seed,dataset,fit_dataset,model,optimizer,lr,classifier,translator,translator_method,translator_rank,batch_size,num_epochs,approx_layer,mlp_linearize,attn_linearize,head_dict,mlp_mode,attn_mode,num_layers,original_accuracy,accuracy,delta_acc,original_auroc,auroc,delta_auroc,original_auprc,auprc,delta_auprc,orig_head_accuracy,orig_head_delta_acc,num_samples,majority_class_rate,params_saved,params_saved_pct
+0,tcga_ut,tcga_ut,owkin/phikon-v2,Adam,0.01,Linear,linear,,,256,5,"[(0, 3)]",[],[],{},identity,identity,3,,0.8099118942731277,,,0.9868097761903152,,,0.8272147317061977,,,,500,0.0871267743514439,,
+1,tcga_ut,tcga_ut,owkin/phikon-v2,Adam,0.01,Linear,linear,,,256,5,"[(0, 3)]",[],[],{},identity,identity,3,,0.8100587371512482,,,0.986567163562186,,,0.8273785722527509,,,,500,0.0871267743514439,,
+2,tcga_ut,tcga_ut,owkin/phikon-v2,Adam,0.01,Linear,linear,,,256,5,"[(0, 3)]",[],[],{},identity,identity,3,,0.8159324522760646,,,0.9864867475734792,,,0.8315099041293929,,,,500,0.0871267743514439,,
+0,tcga_ut,tcga_ut,owkin/phikon-v2,Adam,0.01,Linear,linear,,,256,5,"[(1, 4)]",[],[],{},identity,identity,3,,0.8111355849241312,,,0.9870478019228384,,,0.8258501947155886,,,,500,0.0871267743514439,,
+1,tcga_ut,tcga_ut,owkin/phikon-v2,Adam,0.01,Linear,linear,,,256,5,"[(1, 4)]",[],[],{},identity,identity,3,,0.8105482134116495,,,0.9865395960964414,,,0.8248284341453469,,,,500,0.0871267743514439,,
+2,tcga_ut,tcga_ut,owkin/phikon-v2,Adam,0.01,Linear,linear,,,256,5,"[(1, 4)]",[],[],{},identity,identity,3,,0.8169603524229075,,,0.9870548591407144,,,0.8329691050746099,,,,500,0.0871267743514439,,
+0,tcga_ut,tcga_ut,owkin/phikon-v2,Adam,0.01,Linear,linear,,,256,5,"[(2, 5)]",[],[],{},identity,identity,3,,0.8097650513950073,,,0.98673283898929,,,0.8214524754531707,,,,500,0.0871267743514439,,
+1,tcga_ut,tcga_ut,owkin/phikon-v2,Adam,0.01,Linear,linear,,,256,5,"[(2, 5)]",[],[],{},identity,identity,3,,0.8089574155653451,,,0.9861368888573127,,,0.8218239954437722,,,,500,0.08712677435144396,,

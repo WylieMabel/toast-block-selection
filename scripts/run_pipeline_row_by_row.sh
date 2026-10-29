@@ -1,0 +1,312 @@
+#!/bin/bash
+#SBATCH -p gpu
+#SBATCH --gres=gpu:rtx4090:1
+#SBATCH --cpus-per-task=2
+#SBATCH --mem=96000
+#SBATCH --time=12:00:00
+# Log naming: use LOG_PREFIX if provided, otherwise %j keeps concurrent submissions from
+# writing over each other's logs. This script is routinely run several times at once,
+# one per config shard.
+#SBATCH --output=logs/pipeline_row_by_row_%j.out.txt
+
+usage() {
+    cat <<'USAGE'
+Usage: [sbatch] run_pipeline_row_by_row.sh [CONFIG_CSV] [RESULTS_CSV_NAME]
+
+  CONFIG_CSV         sweep to run; path relative to the project root (required).
+  RESULTS_CSV_NAME   basename written under results/ (or the section results/ for experiments/ configs). Default: the config's own name with
+                     experiments_ swapped for results_, so concurrent shards land in separate
+                     files without having to be told to.
+
+Both are also readable from the environment under the same names; a positional argument wins
+over the environment. Concurrent jobs MUST end up with different RESULTS_CSV_NAMEs -- every
+row rewrites that file in full, so two jobs sharing one lose each other's rows.
+
+  sbatch scripts/run_pipeline_row_by_row.sh experiments/4_1-4_2_choosing_blocks/natural/configs/experiments_deitsmall_cifar100.csv
+
+To customize the log file name, pass --output to sbatch:
+  CONFIG_CSV=experiments/4_1-4_2_choosing_blocks/natural/configs/experiments_deitsmall_cifar100.csv \
+    sbatch --output=logs/s2_deitsmall_cifar100.out.txt \
+      scripts/run_pipeline_row_by_row.sh
+USAGE
+}
+
+case "$1" in
+    -h|--help) usage; exit 0 ;;
+esac
+
+if [ "$#" -gt 2 ]; then
+    echo "ERROR: expected at most 2 arguments, got $#." >&2
+    usage >&2
+    exit 2
+fi
+
+CONFIG_CSV="${1:-${CONFIG_CSV:-}}"
+if [ -z "$CONFIG_CSV" ]; then
+    echo "ERROR: no config CSV given." >&2
+    usage >&2
+    exit 2
+fi
+RESULTS_CSV_NAME="${2:-${RESULTS_CSV_NAME:-}}"
+
+# Derive the results name from the config when it was not given. experiments_foo.csv ->
+# results_foo.csv, which reproduces the old hard-coded pair for the default config and, more
+# usefully, makes a per-shard results file the automatic outcome of passing a per-shard config.
+stem=$(basename "$CONFIG_CSV" .csv)
+DERIVED_RESULTS="results_${stem#experiments_}.csv"
+if [ -z "$RESULTS_CSV_NAME" ]; then
+    RESULTS_CSV_NAME="$DERIVED_RESULTS"
+elif [ -n "$1" ] && [ -z "$2" ] && [ "$RESULTS_CSV_NAME" != "$DERIVED_RESULTS" ]; then
+    # sbatch forwards the submitting shell's environment, so a RESULTS_CSV_NAME exported for
+    # an earlier run silently attaches itself to a config passed positionally here. Left
+    # unnoticed across concurrent shards that is precisely how rows get overwritten.
+    echo "WARNING: config given as an argument but RESULTS_CSV_NAME=$RESULTS_CSV_NAME comes" >&2
+    echo "         from the environment (would otherwise be $DERIVED_RESULTS). Unset it to" >&2
+    echo "         derive the name from the config." >&2
+fi
+export RESULTS_CSV_NAME
+
+# A config under experiments/<section>/configs/ writes into that section's results/ and accuracies/.
+CONFIG_PARENT=$(dirname "$CONFIG_CSV")
+if [ -z "$RESULTS_DIR" ] && [[ "$CONFIG_PARENT" == experiments/*/configs ]]; then
+    SECTION_DIR=$(dirname "$CONFIG_PARENT")
+    RESULTS_DIR="$SECTION_DIR/results"
+    ACCURACIES_DIR="$SECTION_DIR/accuracies"
+fi
+RESULTS_DIR="${RESULTS_DIR:-results}"
+ACCURACIES_DIR="${ACCURACIES_DIR:-$RESULTS_DIR}"
+export RESULTS_DIR
+SAMPLES=500
+
+# Images now vary by seed (encode_vision_full.py shuffles the train split using the seed's
+# RNG state), so phase 1 must be re-run per seed rather than once per row. Test images stay
+# fixed across seeds (see encode_vision_full.py) so accuracy deltas between seeds reflect
+# training noise, not an easier/harder eval sample.
+SEEDS="${SEEDS:-0 1 2}"
+# Exported so sweep_translators.py's GC calls (below) see the same seed list as the row loop
+# -- each seed gets its own translator directory (translator_store_key), so the GC has to
+# enumerate every seed this run loops over to know what's actually saved vs. still needed.
+export SEEDS
+
+# DataLoader workers follow the CPUs the job was given: one core for the main process, the
+# rest for workers. Otherwise encode_vision_full.sh's fixed default can ask for more workers
+# than the job has cores (or leave requested cores idle).
+export NUM_WORKERS="${NUM_WORKERS:-$(( ${SLURM_CPUS_PER_TASK:-8} - 1 ))}"
+echo "CPUs: ${SLURM_CPUS_PER_TASK:-unset}, NUM_WORKERS=$NUM_WORKERS"
+
+# The loop below runs each row in its own process with a single-row temp CSV, so that process
+# cannot see whether a *later* row transfers from the translator it is about to fit. Exporting
+# the whole sweep lets encode_vision_full.py answer that and save only what will be read back.
+export SWEEP_CSV="$CONFIG_CSV"
+
+# 1. Paths, Hugging Face caches and PYTHONPATH (see env.sh; run from the repo root)
+source env.sh
+mkdir -p logs
+
+# 2. Activate the venv
+source $GPU_ENV/bin/activate
+pip install -e .
+
+cd $PROJECT_DIR
+
+# Frozen heads (see _frozen_head_path in train_skipped_full.py) are kept per sweep: concurrent
+# sweeps often train baselines for the same dataset/encoder/seed and must not read each other's
+# heads. Cleared at the start so a head left by an earlier run of this config is never scored.
+if [ -z "$HEADS_DIR" ]; then
+    export HEADS_DIR="$PROJECT_DIR/data/heads/${RESULTS_CSV_NAME%.csv}"
+    rm -rf "$HEADS_DIR"
+fi
+
+# Checked here rather than at the top: CONFIG_CSV is conventionally relative to the project
+# root, which only becomes the working directory now. A missing file otherwise reaches the
+# loop as zero rows and the job "succeeds" having run nothing.
+if [ ! -f "$CONFIG_CSV" ]; then
+    echo "ERROR: config CSV not found: $CONFIG_CSV (looked in $PROJECT_DIR)" >&2
+    exit 2
+fi
+
+# LOCAL_EMBEDDINGS=1 keeps embeddings on the node's local /scratch instead of the quota-limited
+# home. Needs a node with local disk: submit with --tmp=<size> so Slurm only picks those.
+if [ "${LOCAL_EMBEDDINGS:-0}" = "1" ]; then
+    if [ -z "$SLURM_JOB_ID" ]; then
+        echo "ERROR: LOCAL_EMBEDDINGS=1 only works inside a Slurm job." >&2
+        exit 2
+    fi
+    # Remove leftovers from earlier jobs of ours on this node that died without cleaning up
+    # (node crash, SIGKILL). Only /scratch/$USER/<jobid>/embeddings folders whose job is no
+    # longer queued; skipped entirely if squeue fails, so live jobs are never mistaken as dead.
+    # %A (not %i) gives each array element its own numeric id, matching $SLURM_JOB_ID.
+    if MY_JOBS=$(squeue -h -u "$USER" -o %A 2>/dev/null); then
+        for stale in /scratch/$USER/*/; do
+            stale_id=$(basename "$stale")
+            [[ "$stale_id" =~ ^[0-9]+$ ]] || continue
+            [ "$stale_id" = "$SLURM_JOB_ID" ] && continue
+            [ -d "$stale/embeddings" ] || continue
+            grep -qx "$stale_id" <<< "$MY_JOBS" && continue
+            echo "Removing stale scratch from finished job $stale_id: $(du -sh "$stale" 2>/dev/null | cut -f1)"
+            rm -rf "/scratch/$USER/$stale_id"
+        done
+    else
+        echo "WARNING: squeue unavailable, skipping stale /scratch cleanup."
+    fi
+
+    export EMBEDDINGS_DIR="/scratch/$USER/$SLURM_JOB_ID/embeddings"
+    if ! mkdir -p "$EMBEDDINGS_DIR"; then
+        echo "ERROR: cannot create $EMBEDDINGS_DIR on $(hostname)." >&2
+        exit 2
+    fi
+    cleanup_scratch() {
+        rm -rf "/scratch/$USER/$SLURM_JOB_ID"
+        if [ -e "/scratch/$USER/$SLURM_JOB_ID" ]; then
+            echo "SCRATCH CLEANUP FAILED: /scratch/$USER/$SLURM_JOB_ID still exists on $(hostname)"
+        else
+            echo "Scratch cleaned: /scratch/$USER/$SLURM_JOB_ID removed on $(hostname)"
+        fi
+        echo "Left in /scratch/$USER: $(ls /scratch/$USER 2>/dev/null | tr '\n' ' ')"
+    }
+    trap cleanup_scratch EXIT
+    # scancel / time-limit send TERM; turn it into a normal exit so the EXIT cleanup runs.
+    trap 'exit 143' TERM INT
+fi
+
+# 5. Row-by-row loop
+HEADER=$(head -1 "$CONFIG_CSV")
+NUM_ROWS=$(tail -n +2 "$CONFIG_CSV" | grep -c .)
+echo "Config : $CONFIG_CSV"
+echo "Results: $RESULTS_DIR/$RESULTS_CSV_NAME"
+echo "Embeddings: ${EMBEDDINGS_DIR:-data/embeddings} on $(hostname)"
+echo "Running $NUM_ROWS rows from $CONFIG_CSV"
+
+FAILED_ROWS=""
+
+# Delete this row's embeddings (~11GB for imagenet-1k + vit-large). Has to run on the failure
+# paths too, not just the happy one: a row that dies partway through save_to_disk can leave a
+# *_temp directory behind, and on a quota-limited home those accumulate until nothing runs.
+cleanup_row_embeddings() {
+    local emb_dir
+    emb_dir=$(python src/toast/scripts/get_embed_dir.py "$1" "$SAMPLES" 2>/dev/null)
+    [ -n "$emb_dir" ] && [ -d "$emb_dir" ] && rm -rf "$emb_dir"
+    [ -n "$emb_dir" ] && [ -d "${emb_dir}_temp" ] && rm -rf "${emb_dir}_temp"
+    return 0
+}
+
+for i in $(seq 1 "$NUM_ROWS"); do
+    ROW=$(sed -n "$((i + 1))p" "$CONFIG_CSV")
+    [ -z "$(echo "$ROW" | tr -d '[:space:],')" ] && continue
+
+    TEMP_CSV=$(mktemp /tmp/exp_row_XXXXXX.csv)
+    printf '%s\n%s\n' "$HEADER" "$ROW" > "$TEMP_CSV"
+
+    # SECONDS is bash's own elapsed-time counter -- reset per row so the "elapsed" print
+    # below is this row's own wall-clock time, not the whole sweep's, with no GNU-date-only
+    # epoch math needed to compute it.
+    SECONDS=0
+    echo ""
+    echo "=== Row $i / $NUM_ROWS -- started $(date '+%Y-%m-%d %H:%M:%S') ==="
+    echo "$ROW"
+
+    ROW_FAILED=0
+    for seed in $SEEDS; do
+        echo "  -- seed $seed -- $(date '+%Y-%m-%d %H:%M:%S')"
+
+        # Force a fresh encode: phase 1 skips outright if this row's embedding dir already
+        # has a dataset_dict.json (see encode_vision_full.py), which would otherwise reuse
+        # the previous seed's images.
+        cleanup_row_embeddings "$TEMP_CSV"
+
+        LOG=$(mktemp /tmp/exp_row_log_XXXXXX)
+
+        # Phase 1: encode (silent unless it fails)
+        SEED="$seed" CONFIG_CSV="$TEMP_CSV" bash src/toast/scripts/encode_vision_full.sh > "$LOG" 2>&1
+        if [ $? -ne 0 ]; then
+            echo "ERROR: phase 1 failed for row $i, seed $seed:"
+            cat "$LOG"
+            FAILED_ROWS="$FAILED_ROWS $i"
+            ROW_FAILED=1
+            cleanup_row_embeddings "$TEMP_CSV"
+            rm -f "$LOG"
+            break
+        fi
+
+        # Phase 2: train — single seed per call, print params-saved + accuracy
+        SEEDS="$seed" CONFIG_CSV="$TEMP_CSV" bash src/toast/scripts/train_skipped_full.sh > "$LOG" 2>&1
+        if [ $? -ne 0 ]; then
+            echo "ERROR: phase 2 failed for row $i, seed $seed:"
+            cat "$LOG"
+            FAILED_ROWS="$FAILED_ROWS $i"
+            ROW_FAILED=1
+        else
+            grep -E '^[[:space:]]*Params saved:' "$LOG"
+            # Multilabel datasets print their headline metric as "macro-AUC" (train_skipped_full.py).
+            if ! grep -oE '(Accuracy|macro-AUC): [0-9.]+' "$LOG"; then
+                # Phase 2 produced no accuracy despite exiting 0. Keep the log rather than
+                # deleting it -- this is exactly the case where the cause is in the text and
+                # discarding it leaves only the symptom.
+                KEPT="logs/failed_row_${i}_seed_${seed}.log"
+                cp "$LOG" "$KEPT"
+                echo "(no result — full log kept at $KEPT)"
+                FAILED_ROWS="$FAILED_ROWS $i"
+                ROW_FAILED=1
+            fi
+            grep -E '^[[:space:]]*Frozen head score:' "$LOG"
+        fi
+        rm -f "$LOG"
+
+        cleanup_row_embeddings "$TEMP_CSV"
+        [ "$ROW_FAILED" -eq 1 ] && break
+    done
+
+    echo "=== Row $i / $NUM_ROWS -- finished $(date '+%Y-%m-%d %H:%M:%S') (elapsed ${SECONDS}s) ==="
+
+    # Delete any translator this sweep saved that no later row still needs, right after this
+    # row finishes rather than waiting for the whole file -- see sweep_translators.py. Matters
+    # when several small sweeps run concurrently: each one's peak translator count is bounded to
+    # "fit but not yet fully consumed", not "every span this file will ever fit".
+    ROW_GC=$(python src/toast/scripts/sweep_translators.py "$SWEEP_CSV" "$SAMPLES" "$((i - 1))" 2>/dev/null)
+    if [ -n "$ROW_GC" ]; then
+        echo "$ROW_GC" | while IFS= read -r d; do
+            if [ -n "$d" ] && [ -d "$d" ]; then
+                echo "  [translator gc] no longer needed after row $i, deleting: $d"
+                rm -rf "$d"
+            fi
+        done
+    fi
+
+    rm -f "$TEMP_CSV"
+done
+
+# Wipe the translators this sweep created, pass or fail. Scoped to this sweep's own keys --
+# the store is shared, so a blanket rm would take out maps another sweep still needs. Sweeps
+# with no transfer rows saved nothing and this is a no-op.
+SAVED_TRANSLATORS=$(python src/toast/scripts/sweep_translators.py "$SWEEP_CSV" "$SAMPLES" 2>/dev/null)
+if [ -n "$SAVED_TRANSLATORS" ]; then
+    echo ""
+    echo "Removing $(echo "$SAVED_TRANSLATORS" | wc -l | tr -d ' ') translator(s) saved by this sweep:"
+    echo "$SAVED_TRANSLATORS" | while IFS= read -r d; do
+        [ -n "$d" ] && [ -d "$d" ] && du -sh "$d" && rm -rf "$d"
+    done
+fi
+
+# Package the per-seed results into one mean/std-per-config summary, same aggregation
+# scripts/calculate_accuracies.py already uses elsewhere. Runs even on a partial/failed
+# sweep -- whatever rows did complete are still worth summarizing rather than only ever
+# available as a manual follow-up step.
+SUMMARY_NAME="accuracies_${RESULTS_CSV_NAME}"
+if [ -f "$RESULTS_DIR/$RESULTS_CSV_NAME" ]; then
+    mkdir -p "$ACCURACIES_DIR"
+    python scripts/calculate_accuracies.py \
+        --input "$RESULTS_DIR/$RESULTS_CSV_NAME" \
+        --output "$ACCURACIES_DIR/$SUMMARY_NAME"
+    echo "Summary (mean/std per config): $ACCURACIES_DIR/$SUMMARY_NAME"
+fi
+
+if [ -n "$FAILED_ROWS" ]; then
+    echo ""
+    echo "=================================================="
+    echo "INCOMPLETE: $(echo $FAILED_ROWS | wc -w) of $NUM_ROWS rows failed:$FAILED_ROWS"
+    echo "$RESULTS_DIR/$RESULTS_CSV_NAME is missing those configs."
+    echo "=================================================="
+    exit 1
+fi
+
+echo "Done. All $NUM_ROWS rows completed."

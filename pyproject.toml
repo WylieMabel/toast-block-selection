@@ -1,0 +1,39 @@
+[build-system]
+requires = ["setuptools>=64", "setuptools-scm"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "toast"
+version = "0.1.0"
+description = "Which Blocks to Approximate? Choosing TOAST block approximations in general-purpose and medical vision transformers"
+readme = "README.md"
+license = "MIT"
+requires-python = ">=3.10"
+authors = [{ name = "Mabel Wylie" }, { name = "Irene Cannistraci" }]
+
+dependencies = [
+    "torch>=2.0",
+    "transformers>=4.30",
+    "datasets>=2.14",
+    "latentis",
+    "fire",
+    "pandas",
+    "numpy",
+    "scikit-learn",
+    "tqdm",
+]
+
+[project.optional-dependencies]
+analysis = ["matplotlib", "scipy", "jupyter"]
+clip = ["open_clip_torch"]
+wandb = ["wandb"]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.black]
+line-length = 120
+
+[tool.isort]
+profile = "black"
+line_length = 120
